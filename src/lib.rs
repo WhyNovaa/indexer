@@ -8,7 +8,6 @@ use std::{
     path::PathBuf,
     thread,
 };
-
 use blk_index_to_blk_path::*;
 use blk_recap::BlkRecap;
 use crossbeam::channel::{Receiver, bounded};
@@ -36,7 +35,6 @@ pub trait InnerBlockHash: Sized + Send + Sync {
     fn consensus_decode<C: std::io::Read + ?Sized>(cursor: &mut C) -> Result<Self, Self::Error>;
 }
 
-#[cfg(feature = "bellscoin")]
 impl InnerBlockHash for bellscoin::Block {
     type Error = bellscoin::consensus::encode::Error;
 
@@ -47,21 +45,6 @@ impl InnerBlockHash for bellscoin::Block {
 
     fn consensus_decode<C: std::io::Read + ?Sized>(cursor: &mut C) -> Result<Self, Self::Error> {
         bellscoin::consensus::Decodable::consensus_decode(cursor)
-    }
-}
-
-#[cfg(feature = "dogecoin")]
-impl InnerBlockHash for nintondo_dogecoin::Block {
-    type Error = nintondo_dogecoin::consensus::encode::Error;
-
-    fn inner_block_hash(&self) -> sha256d::Hash {
-        let bytes =
-            *nintondo_dogecoin::hashes::Hash::as_byte_array(self.block_hash().as_raw_hash());
-        sha256d::Hash::from_byte_array(bytes)
-    }
-
-    fn consensus_decode<C: std::io::Read + ?Sized>(cursor: &mut C) -> Result<Self, Self::Error> {
-        nintondo_dogecoin::consensus::Decodable::consensus_decode(cursor)
     }
 }
 
@@ -77,7 +60,6 @@ pub trait NodeClient: Send + Sync {
     ) -> Result<(Height, Confirmations), Self::Error>;
 }
 
-#[cfg(feature = "bellscoin")]
 impl NodeClient for bellscoincore_rpc::Client {
     type Error = bellscoincore_rpc::Error;
 
@@ -122,27 +104,26 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
     }
 
     /// Returns a crossbeam channel receiver that receives `(Height, Block, BlockHash)` tuples from an **inclusive** range (`start` and `end`)
-    pub fn parse(
+    fn parse(
         &self,
         start: Option<Height>,
         end: Option<Height>,
-    ) -> Receiver<(Height, T, bitcoin_hashes::sha256d::Hash)> {
+    ) -> Receiver<(Height, T, sha256d::Hash)> {
         let blocks_dir = self.blocks_dir.as_path();
+        let magic = self.magic;
         let rpc = self.rpc;
-
-        let (send_bytes, recv_bytes) = bounded(BOUND_CAP);
-        let (send_block, recv_block) = bounded(BOUND_CAP);
-        let (send_height_block_hash, recv_height_block_hash) = bounded(BOUND_CAP);
 
         let blk_index_to_blk_path = BlkIndexToBlkPath::scan(blocks_dir);
 
         let (mut blk_index_to_blk_recap, blk_index) =
             BlkIndexToBlkRecap::import(blocks_dir, &blk_index_to_blk_path, start);
 
-        let magic = self.magic;
+        let (send_bytes, recv_bytes) = bounded(BOUND_CAP);
+        let (send_block, recv_block) = bounded(BOUND_CAP);
+        let (height_block_hash_sender, height_block_hash_receiver) = bounded(BOUND_CAP);
 
         thread::spawn(move || {
-            blk_index_to_blk_path
+            let _ = blk_index_to_blk_path
                 .range(blk_index..)
                 .try_for_each(move |(blk_index, blk_path)| {
                     let blk_index = *blk_index;
@@ -209,14 +190,13 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
                 })
             };
 
-            recv_bytes.iter().try_for_each(|tuple| {
+            let _ = recv_bytes.iter().try_for_each(|tuple| {
                 bulk.push(tuple);
 
                 if bulk.len() < BOUND_CAP / 2 {
                     return ControlFlow::Continue(());
                 }
 
-                // Sending in bulk to not lock threads in standby
                 drain_and_send(&mut bulk)
             });
 
@@ -228,19 +208,13 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
 
             let mut future_blocks = BTreeMap::default();
 
-            recv_block
-                .iter()
-                .try_for_each(|(blk_metadata, block)| -> ControlFlow<(), _> {
-                    let hash = block.inner_block_hash();
-                    let header = rpc.get_block_header_info(&hash);
-
-                    if header.is_err() {
-                        return ControlFlow::Continue(());
-                    }
-                    let (height, confirmations) = header.unwrap();
-                    if confirmations <= 0 {
-                        return ControlFlow::Continue(());
-                    }
+            let _ = recv_block.iter()
+                .try_for_each(|(blk_metadata, decoded_block)| -> ControlFlow<(), _>{
+                    let hash = decoded_block.inner_block_hash();
+                    let height = match rpc.get_block_header_info(&hash) {
+                        Ok((height, confirmations)) if confirmations > 0 => height,
+                        _ => return ControlFlow::Continue(()),
+                    };
 
                     let len = blk_index_to_blk_recap.tree.len();
                     if blk_metadata.index == len as u16 || blk_metadata.index + 1 == len as u16 {
@@ -269,17 +243,17 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
                     }
 
                     let mut opt = if current_height == height {
-                        Some((block, hash))
+                        Some((decoded_block, hash))
                     } else {
                         if start.is_none_or(|start| start <= height)
                             && end.is_none_or(|end| end >= height)
                         {
-                            future_blocks.insert(height, (block, hash));
+                            future_blocks.insert(height, (decoded_block, hash));
                         }
                         None
                     };
 
-                    while let Some((block, hash)) = opt.take().or_else(|| {
+                    while let Some((decoded_block, hash)) = opt.take().or_else(|| {
                         if !future_blocks.is_empty() {
                             future_blocks.remove(&current_height)
                         } else {
@@ -290,9 +264,11 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
                             return ControlFlow::Break(());
                         }
 
-                        send_height_block_hash
-                            .send((current_height, block, hash))
-                            .unwrap();
+                        let Ok(_) =
+                            height_block_hash_sender.send((current_height, decoded_block, hash))
+                        else {
+                            return ControlFlow::Break(());
+                        };
 
                         if end.is_some_and(|end| end == current_height) {
                             return ControlFlow::Break(());
@@ -307,6 +283,6 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
             blk_index_to_blk_recap.export();
         });
 
-        recv_height_block_hash
+        height_block_hash_receiver
     }
 }
