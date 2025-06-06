@@ -8,9 +8,11 @@ use std::{
     path::PathBuf,
     thread,
 };
+use std::cmp::max;
+use std::thread::sleep;
 use blk_index_to_blk_path::*;
 use blk_recap::BlkRecap;
-use crossbeam::channel::{Receiver, bounded};
+use crossbeam::channel::{Receiver, bounded, Sender};
 use rayon::prelude::*;
 
 mod blk_index_to_blk_path;
@@ -35,57 +37,37 @@ pub trait InnerBlockHash: Sized + Send + Sync {
     fn consensus_decode<C: std::io::Read + ?Sized>(cursor: &mut C) -> Result<Self, Self::Error>;
 }
 
-impl InnerBlockHash for bellscoin::Block {
-    type Error = bellscoin::consensus::encode::Error;
+pub type Height = u32;
+pub type Confirmations = i32;
 
-    fn inner_block_hash(&self) -> sha256d::Hash {
-        let bytes = *bellscoin::hashes::Hash::as_byte_array(self.block_hash().as_raw_hash());
-        sha256d::Hash::from_byte_array(bytes)
-    }
-
-    fn consensus_decode<C: std::io::Read + ?Sized>(cursor: &mut C) -> Result<Self, Self::Error> {
-        bellscoin::consensus::Decodable::consensus_decode(cursor)
-    }
-}
-
-pub(crate) type Height = u32;
-pub(crate) type Confirmations = i32;
-
-pub trait NodeClient: Send + Sync {
+pub trait NodeClient<T: InnerBlockHash>: Send + Sync {
     type Error: std::fmt::Debug;
 
     fn get_block_header_info(
         &self,
         hash: &sha256d::Hash,
     ) -> Result<(Height, Confirmations), Self::Error>;
-}
 
-impl NodeClient for bellscoincore_rpc::Client {
-    type Error = bellscoincore_rpc::Error;
-
-    fn get_block_header_info(
+    fn get_block_hash(&self, height: Height) -> Result<sha256d::Hash, Self::Error>;
+    fn get_best_block_hash(&self) -> Result<sha256d::Hash, Self::Error>;
+    fn get_block_height(
         &self,
         hash: &sha256d::Hash,
-    ) -> Result<(Height, Confirmations), Self::Error> {
-        let hash = <bellscoin::BlockHash as bellscoin::hashes::Hash>::from_byte_array(
-            hash.to_byte_array(),
-        );
+    ) -> Result<Height, Self::Error>;
 
-        bellscoincore_rpc::RpcApi::get_block_header_info(self, &hash)
-            .map(|x| (x.height as u32, x.confirmations))
-    }
+    fn get_block(&self, hash: &sha256d::Hash) -> Result<T, Self::Error>;
 }
 
 const BOUND_CAP: usize = 50;
 
-pub struct Parser<T: InnerBlockHash, U: NodeClient + 'static> {
+pub struct Parser<T: InnerBlockHash, U: NodeClient<T> + 'static> {
     blocks_dir: PathBuf,
     rpc: &'static U,
     magic: [u8; 4],
     _block: PhantomData<T>,
 }
 
-impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
+impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
     pub fn new(blocks_dir: PathBuf, rpc: &'static U, magic: [u8; 4]) -> Self {
         Self {
             blocks_dir,
@@ -209,7 +191,7 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
             let mut future_blocks = BTreeMap::default();
 
             let _ = recv_block.iter()
-                .try_for_each(|(blk_metadata, decoded_block)| -> ControlFlow<(), _>{
+                .try_for_each(|(blk_metadata, decoded_block)| -> ControlFlow<(), _> {
                     let hash = decoded_block.inner_block_hash();
                     let height = match rpc.get_block_header_info(&hash) {
                         Ok((height, confirmations)) if confirmations > 0 => height,
@@ -232,9 +214,7 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
                             .tree
                             .entry(blk_metadata.index)
                             .and_modify(|recap| {
-                                if recap.max_height < height {
-                                    recap.max_height = height;
-                                }
+                                recap.max_height = max(recap.max_height, height);
                             })
                             .or_insert(BlkRecap {
                                 max_height: height,
@@ -280,9 +260,138 @@ impl<T: InnerBlockHash + 'static, U: NodeClient + 'static> Parser<T, U> {
                     ControlFlow::Continue(())
                 });
 
+            if end.is_none_or(|end| end > current_height) {
+
+            }
             blk_index_to_blk_recap.export();
         });
 
         height_block_hash_receiver
+    }
+
+    pub fn rpc_parse(
+        tx: Sender<(Height, T, sha256d::Hash)>,
+        rpc: &'static U,
+        mut next_to_save_block_height: Height,
+        end: Option<Height>,
+    ) {
+        loop {
+            if end.is_some_and(|end| next_to_save_block_height > end) {
+                break;
+            }
+
+            if end.is_none() {
+                let Ok(tip_hash) = rpc.get_best_block_hash()
+                else {
+                    break;
+                };
+
+                let Ok(tip_height) = rpc.get_block_height(&tip_hash)
+                else {
+                    break;
+                };
+
+                if tip_height < next_to_save_block_height {
+                    sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            }
+
+            let Ok(hash) = rpc.get_block_hash(next_to_save_block_height)
+            else {
+                break;
+            };
+
+            let Ok(block) = rpc.get_block(&hash)
+            else {
+                break;
+            };
+
+            let Ok(_) = tx.send((next_to_save_block_height, block, hash))
+            else {
+                break;
+            };
+
+            next_to_save_block_height += 1
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::PathBuf;
+    use bellscoin::{Block, BlockHash};
+    use bellscoin::hashes::Hash as BellsHash;
+    use bellscoincore_rpc::{Auth, Client, RpcApi};
+    use bitcoin_hashes::{sha256d, Sha256d};
+    use bitcoin_hashes::sha256d::Hash;
+    use crate::{Confirmations, Height, InnerBlockHash, NodeClient, Parser};
+
+    pub struct Test {
+        cl: Client,
+    }
+
+    #[derive(Debug)]
+    pub struct TestBlock(Block);
+
+    impl InnerBlockHash for TestBlock {
+        type Error = bellscoin::consensus::encode::Error;
+
+        fn inner_block_hash(&self) -> sha256d::Hash {
+            let bytes = *bellscoin::hashes::Hash::as_byte_array(self.0.block_hash().as_raw_hash());
+            sha256d::Hash::from_byte_array(bytes)
+        }
+
+        fn consensus_decode<C: std::io::Read + ?Sized>(cursor: &mut C) -> Result<Self, Self::Error> {
+            let block = bellscoin::consensus::Decodable::consensus_decode(cursor)?;
+            Ok(TestBlock(block))
+        }
+    }
+
+    impl NodeClient<TestBlock> for Test {
+        type Error = String;
+
+        fn get_block_header_info(&self, hash: &Hash) -> Result<(Height, Confirmations), Self::Error> {
+            let hash = <bellscoin::BlockHash as bellscoin::hashes::Hash>::from_byte_array(
+                hash.to_byte_array(),
+            );
+
+            self.cl.get_block_header_info(&hash).map_err(|e| e.to_string()).map(|x| (x.height as Height, x.confirmations as Confirmations))
+        }
+
+        fn get_block_hash(&self, height: Height) -> Result<Hash, Self::Error> {
+            self.cl.get_block_hash(height as u64).map_err(|e| e.to_string()).map(|h| Sha256d::from_byte_array(h.to_byte_array()))
+        }
+
+        fn get_best_block_hash(&self) -> Result<Hash, Self::Error> {
+            self.cl.get_best_block_hash().map_err(|e| e.to_string()).map(|h| Sha256d::from_byte_array(h.to_byte_array()))
+        }
+
+        fn get_block_height(&self, hash: &Hash) -> Result<Height, Self::Error> {
+            self.cl.get_block_header_info(&BlockHash::from(bellscoin::hashes::sha256d::Hash::from_byte_array(hash.to_byte_array()))).map_err(|e| e.to_string()).map(|header| header.height as Height)
+        }
+
+        fn get_block(&self, hash: &Hash) -> Result<TestBlock, Self::Error> {
+            self.cl.get_block(&BlockHash::from(bellscoin::hashes::sha256d::Hash::from_byte_array(hash.to_byte_array()))).map_err(|e| e.to_string()).map(|b| TestBlock(b))
+        }
+    }
+
+    #[test]
+    pub fn test() {
+        let cl = Test { cl: bellscoincore_rpc::Client::new("127.0.0.1:19918", Auth::UserPass("test".to_string(), "SKHFWUItEst1294881927589)))17D".to_string())).unwrap() };
+
+
+        let parser = Parser::<TestBlock, Test>::new(
+            PathBuf::from("/home/nova/bells_temp"),
+            &cl,
+            bellscoin::Network::Testnet.magic().to_bytes(),
+        );
+
+        let r = parser.parse(Some(2), Some(4));
+
+        for i in r.recv() {
+            println!("{i:?}")
+        }
+
     }
 }

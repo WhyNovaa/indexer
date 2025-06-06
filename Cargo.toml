@@ -15,11 +15,8 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["float_roundtrip"] }
 zerocopy = { version = "0.8.24", features = ["derive"] }
 bitcoin_hashes = { version = "0.16.0" }
-bellscoin = { version = "0.30.7", optional = true }
-nintondo-dogecoin = { version = "0.30.6", optional = true }
-bellscoincore-rpc = { version = "0.17.4", optional = true }
 
-[features]
-default = ["bellscoin", "dogecoin"]
-bellscoin = ["dep:bellscoin", "dep:bellscoincore-rpc"]
-dogecoin = ["dep:nintondo-dogecoin"]
+
+bellscoin = { version = "0.31.0" }
+bellscoincore-rpc = { version = "0.18.0" }
+
