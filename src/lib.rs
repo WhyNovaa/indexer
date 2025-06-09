@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 use std::cmp::max;
+use std::sync::Arc;
 use std::thread::sleep;
 use blk_index_to_blk_path::*;
 use blk_recap::BlkRecap;
@@ -62,16 +63,16 @@ const BOUND_CAP: usize = 50;
 
 pub struct Parser<T: InnerBlockHash, U: NodeClient<T> + 'static> {
     blocks_dir: PathBuf,
-    rpc: &'static U,
+    rpc: Arc<U>,
     magic: [u8; 4],
     _block: PhantomData<T>,
 }
 
 impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
-    pub fn new(blocks_dir: PathBuf, rpc: &'static U, magic: [u8; 4]) -> Self {
+    pub fn new(blocks_dir: PathBuf, rpc: U, magic: [u8; 4]) -> Self {
         Self {
             blocks_dir,
-            rpc,
+            rpc: Arc::new(rpc),
             magic,
             _block: PhantomData,
         }
@@ -93,7 +94,7 @@ impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
     ) -> Receiver<(Height, T, sha256d::Hash)> {
         let blocks_dir = self.blocks_dir.as_path();
         let magic = self.magic;
-        let rpc = self.rpc;
+        let rpc = Arc::clone(&self.rpc);
 
         let blk_index_to_blk_path = BlkIndexToBlkPath::scan(blocks_dir);
 
@@ -244,11 +245,9 @@ impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
                             return ControlFlow::Break(());
                         }
 
-                        let Ok(_) =
-                            height_block_hash_sender.send((current_height, decoded_block, hash))
-                        else {
+                        if height_block_hash_sender.send((current_height, decoded_block, hash)).is_err() {
                             return ControlFlow::Break(());
-                        };
+                        }
 
                         if end.is_some_and(|end| end == current_height) {
                             return ControlFlow::Break(());
@@ -261,7 +260,7 @@ impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
                 });
 
             if end.is_none_or(|end| end > current_height) {
-
+                Self::rpc_parse(height_block_hash_sender, rpc, current_height, end);
             }
             blk_index_to_blk_recap.export();
         });
@@ -271,7 +270,7 @@ impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
 
     pub fn rpc_parse(
         tx: Sender<(Height, T, sha256d::Hash)>,
-        rpc: &'static U,
+        rpc: Arc<U>,
         mut next_to_save_block_height: Height,
         end: Option<Height>,
     ) {
@@ -307,8 +306,7 @@ impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
                 break;
             };
 
-            let Ok(_) = tx.send((next_to_save_block_height, block, hash))
-            else {
+            if tx.send((next_to_save_block_height, block, hash)).is_err() {
                 break;
             };
 
@@ -378,18 +376,17 @@ mod test {
 
     #[test]
     pub fn test() {
-        let cl = Test { cl: bellscoincore_rpc::Client::new("127.0.0.1:19918", Auth::UserPass("test".to_string(), "SKHFWUItEst1294881927589)))17D".to_string())).unwrap() };
-
+        let cl = Test { cl: Client::new("127.0.0.1:19918", Auth::UserPass("test".to_string(), "SKHFWUItEst1294881927589)))17D".to_string())).unwrap() };
 
         let parser = Parser::<TestBlock, Test>::new(
             PathBuf::from("/home/nova/bells_temp"),
-            &cl,
+            cl,
             bellscoin::Network::Testnet.magic().to_bytes(),
         );
 
-        let r = parser.parse(Some(2), Some(4));
+        let r = parser.parse(Some(1), None);
 
-        for i in r.recv() {
+        while let Ok(i) = r.recv() {
             println!("{i:?}")
         }
 
