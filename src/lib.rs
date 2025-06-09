@@ -68,7 +68,7 @@ pub struct Parser<T: InnerBlockHash, U: NodeClient<T> + 'static> {
     _block: PhantomData<T>,
 }
 
-impl<T: InnerBlockHash + 'static, U: NodeClient<T> + 'static> Parser<T, U> {
+impl<T: InnerBlockHash + 'static, U: NodeClient<T>> Parser<T, U> {
     pub fn new(blocks_dir: PathBuf, rpc: U, magic: [u8; 4]) -> Self {
         Self {
             blocks_dir,
@@ -325,7 +325,7 @@ mod test {
     use bitcoin_hashes::sha256d::Hash;
     use crate::{Confirmations, Height, InnerBlockHash, NodeClient, Parser};
 
-    pub struct Test {
+    pub struct TestClient {
         cl: Client,
     }
 
@@ -346,7 +346,7 @@ mod test {
         }
     }
 
-    impl NodeClient<TestBlock> for Test {
+    impl NodeClient<TestBlock> for TestClient {
         type Error = String;
 
         fn get_block_header_info(&self, hash: &Hash) -> Result<(Height, Confirmations), Self::Error> {
@@ -376,9 +376,9 @@ mod test {
 
     #[test]
     pub fn test() {
-        let cl = Test { cl: Client::new("127.0.0.1:19918", Auth::UserPass("test".to_string(), "SKHFWUItEst1294881927589)))17D".to_string())).unwrap() };
+        let cl = TestClient { cl: Client::new("127.0.0.1:19918", Auth::UserPass("test".to_string(), "SKHFWUItEst1294881927589)))17D".to_string())).unwrap() };
 
-        let parser = Parser::<TestBlock, Test>::new(
+        let parser = Parser::<TestBlock, TestClient>::new(
             PathBuf::from("/home/nova/bells_temp"),
             cl,
             bellscoin::Network::Testnet.magic().to_bytes(),
